@@ -1,0 +1,234 @@
+name: IIQ Build Setup
+description: >-
+  Fetches proprietary SailPoint IdentityIQ JARs from a private repository and
+  stages them for a build, then sets up Java, Gradle and optionally Node.js.
+author: Instrumental Identity
+
+branding:
+  icon: package
+  color: blue
+
+inputs:
+  versions:
+    description: >-
+      Whitespace-separated list of IIQ_VERSION:DEST_DIR pairs, for example
+      "8.4:lib/sailpoint 9.0:lib-9.0/sailpoint". DEST_DIR is relative to the
+      workspace.
+    required: true
+  jars:
+    description: Base names of JARs that must exist for every version.
+    default: identityiq connector-bundle-identityiq
+  optional-jars:
+    description: Base names of JARs to stage when they exist for a version.
+    default: pam-credential
+
+  app-id:
+    description: >-
+      GitHub App ID with read access to the source repository. Used with
+      app-private-key. Preferred over token and ssh-key.
+    default: ""
+  app-private-key:
+    description: Private key for the GitHub App in app-id.
+    default: ""
+  token:
+    description: A token with read access to the source repository.
+    default: ""
+  ssh-key:
+    description: A read-only deploy key for the source repository.
+    default: ""
+
+  source-repository:
+    description: Private repository holding the JARs, as owner/name.
+    default: instrumental-id/iiq-common-library
+  source-ref:
+    description: Branch, tag or SHA to read the JARs from. Defaults to the default branch.
+    default: ""
+  source-path:
+    description: Directory within the source repository holding NAME-VERSION.jar files.
+    default: lib/iiq-versions
+
+  fail-if-unavailable:
+    description: >-
+      Fail when no credentials were supplied. Leave false to let fork PRs,
+      which receive no secrets, skip the build instead of failing.
+    default: "false"
+
+  java-version:
+    description: Java version to install. Empty to skip Java setup.
+    default: "21"
+  java-distribution:
+    description: Java distribution for actions/setup-java.
+    default: temurin
+  setup-gradle:
+    description: Whether to run gradle/actions/setup-gradle.
+    default: "true"
+
+  node-version:
+    description: >-
+      Node.js version to install, e.g. "20" or "lts/*". Leave both this and
+      node-version-file empty to skip Node setup.
+    default: ""
+  node-version-file:
+    description: File to read the Node.js version from, e.g. ".nvmrc" or "ui/package.json".
+    default: ""
+  node-cache:
+    description: Package manager whose cache to restore (npm, yarn or pnpm). Empty for no caching.
+    default: ""
+  node-cache-dependency-path:
+    description: >-
+      Lock file(s) for the Node cache key, for projects whose lock file isn't
+      at the repository root, e.g. "ui/package-lock.json".
+    default: ""
+
+outputs:
+  available:
+    description: >-
+      "true" when the JARs were staged, "false" when no credentials were
+      supplied (e.g. a fork PR).
+    value: ${{ steps.plan.outputs.available }}
+
+runs:
+  using: composite
+  steps:
+    - name: Plan IIQ JAR fetch
+      id: plan
+      shell: bash
+      env:
+        VERSIONS: ${{ inputs.versions }}
+        JARS: ${{ inputs.jars }}
+        OPTIONAL_JARS: ${{ inputs.optional-jars }}
+        SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+        SOURCE_PATH: ${{ inputs.source-path }}
+        FAIL_IF_UNAVAILABLE: ${{ inputs.fail-if-unavailable }}
+        HAS_APP: ${{ inputs.app-id != '' && inputs.app-private-key != '' }}
+        HAS_TOKEN: ${{ inputs.token != '' }}
+        HAS_SSH_KEY: ${{ inputs.ssh-key != '' }}
+      run: |
+        set -euo pipefail
+
+        if [ "$HAS_APP" = "true" ]; then
+          mode=app
+        elif [ "$HAS_TOKEN" = "true" ]; then
+          mode=token
+        elif [ "$HAS_SSH_KEY" = "true" ]; then
+          mode=ssh
+        else
+          mode=none
+        fi
+
+        if [ "$mode" = "none" ]; then
+          if [ "$FAIL_IF_UNAVAILABLE" = "true" ]; then
+            echo "::error::No credentials supplied for $SOURCE_REPOSITORY; cannot fetch IIQ JARs."
+            exit 1
+          fi
+          echo "::notice::IIQ JARs are not available to this run (no credentials; likely a fork PR). Skipping fetch."
+          echo "available=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        if [[ ! "$SOURCE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+          echo "::error::source-repository must be owner/name, got '$SOURCE_REPOSITORY'"
+          exit 1
+        fi
+
+        set -f
+        pairs=($VERSIONS)
+        set +f
+        if [ ${#pairs[@]} -eq 0 ]; then
+          echo "::error::versions is empty"
+          exit 1
+        fi
+
+        patterns=""
+        for pair in "${pairs[@]}"; do
+          version="${pair%%:*}"
+          dest="${pair#*:}"
+          if [ "$pair" = "$version" ] || [ -z "$dest" ]; then
+            echo "::error::Each versions entry must be VERSION:DEST_DIR, got '$pair'"
+            exit 1
+          fi
+          if [[ ! "$version" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::Invalid IIQ version '$version'"
+            exit 1
+          fi
+          for name in $JARS $OPTIONAL_JARS; do
+            patterns+="${SOURCE_PATH%/}/$name-$version.jar"$'\n'
+          done
+        done
+
+        {
+          echo "available=true"
+          echo "mode=$mode"
+          echo "owner=${SOURCE_REPOSITORY%%/*}"
+          echo "repo=${SOURCE_REPOSITORY#*/}"
+          echo "pairs=${pairs[*]}"
+          echo "patterns<<__IIQ_PATTERNS__"
+          printf '%s' "$patterns"
+          echo "__IIQ_PATTERNS__"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Create GitHub App token
+      id: app-token
+      if: steps.plan.outputs.mode == 'app'
+      uses: actions/create-github-app-token@v2
+      with:
+        app-id: ${{ inputs.app-id }}
+        private-key: ${{ inputs.app-private-key }}
+        owner: ${{ steps.plan.outputs.owner }}
+        repositories: ${{ steps.plan.outputs.repo }}
+
+    # Only the requested JARs are downloaded. Do not cache or upload this path
+    # or the staged destination directories: on a public repo, caches can be
+    # restored by fork PRs and artifacts are downloadable by anyone.
+    - name: Fetch IIQ JARs
+      if: steps.plan.outputs.available == 'true'
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ inputs.source-repository }}
+        ref: ${{ inputs.source-ref }}
+        token: ${{ steps.app-token.outputs.token || inputs.token || github.token }}
+        ssh-key: ${{ steps.plan.outputs.mode == 'ssh' && inputs.ssh-key || '' }}
+        path: .iiq-build-setup-src
+        persist-credentials: false
+        filter: blob:none
+        sparse-checkout-cone-mode: false
+        sparse-checkout: ${{ steps.plan.outputs.patterns }}
+
+    - name: Stage IIQ JARs
+      if: steps.plan.outputs.available == 'true'
+      shell: bash
+      env:
+        PAIRS: ${{ steps.plan.outputs.pairs }}
+        SOURCE_PATH: ${{ inputs.source-path }}
+        IIQ_JARS: ${{ inputs.jars }}
+        IIQ_OPTIONAL_JARS: ${{ inputs.optional-jars }}
+        STAGE: ${{ github.action_path }}/stage.sh
+      run: |
+        set -euo pipefail
+        src=".iiq-build-setup-src/${SOURCE_PATH%/}"
+        trap 'rm -rf .iiq-build-setup-src' EXIT
+        for pair in $PAIRS; do
+          bash "$STAGE" "$src" "${pair%%:*}" "${pair#*:}"
+        done
+
+    - name: Set up Java
+      if: inputs.java-version != ''
+      uses: actions/setup-java@v4
+      with:
+        distribution: ${{ inputs.java-distribution }}
+        java-version: ${{ inputs.java-version }}
+
+    # Caches ~/.gradle only. The IIQ JARs are file dependencies and never land there.
+    - name: Set up Gradle
+      if: inputs.setup-gradle == 'true'
+      uses: gradle/actions/setup-gradle@v4
+
+    # Caches only the package manager's download cache, never the IIQ JARs.
+    - name: Set up Node.js
+      if: inputs.node-version != '' || inputs.node-version-file != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        node-version-file: ${{ inputs.node-version-file }}
+        cache: ${{ inputs.node-cache }}
+        cache-dependency-path: ${{ inputs.node-cache-dependency-path }}

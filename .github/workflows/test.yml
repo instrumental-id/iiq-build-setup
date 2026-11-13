@@ -1,0 +1,87 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  stage-script:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Stage dummy JARs
+        env:
+          IIQ_JARS: identityiq connector-bundle-identityiq
+          IIQ_OPTIONAL_JARS: pam-credential
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src"
+          for f in identityiq-8.4 connector-bundle-identityiq-8.4 identityiq-9.0 connector-bundle-identityiq-9.0 pam-credential-9.0; do
+            echo "$f" > "$RUNNER_TEMP/src/$f.jar"
+          done
+
+          ./stage.sh "$RUNNER_TEMP/src" 8.4 out/a
+          ./stage.sh "$RUNNER_TEMP/src" 9.0 out/b
+
+          test "$(cat out/a/identityiq.jar)" = identityiq-8.4
+          test "$(cat out/b/connector-bundle-identityiq.jar)" = connector-bundle-identityiq-9.0
+          test "$(cat out/b/pam-credential.jar)" = pam-credential-9.0
+          test ! -e out/a/pam-credential.jar
+
+          if ./stage.sh "$RUNNER_TEMP/src" 7.1 out/c; then
+            echo "Expected failure for a missing version" >&2
+            exit 1
+          fi
+
+  no-credentials:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Skips without credentials
+        id: skip
+        uses: ./
+        with:
+          versions: "8.4:lib/sailpoint"
+          java-version: ""
+          setup-gradle: "false"
+
+      - name: Fails without credentials when required
+        id: required
+        continue-on-error: true
+        uses: ./
+        with:
+          versions: "8.4:lib/sailpoint"
+          fail-if-unavailable: "true"
+          java-version: ""
+          setup-gradle: "false"
+
+      - name: Check results
+        env:
+          SKIP_AVAILABLE: ${{ steps.skip.outputs.available }}
+          REQUIRED_OUTCOME: ${{ steps.required.outcome }}
+        run: |
+          test "$SKIP_AVAILABLE" = false
+          test "$REQUIRED_OUTCOME" = failure
+          test ! -e lib/sailpoint
+
+  toolchains:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # No credentials, so the JAR fetch is skipped but Java, Gradle and Node are still set up
+      - uses: ./
+        with:
+          versions: "8.4:lib/sailpoint"
+          java-version: "17"
+          node-version: "20"
+
+      - name: Check toolchains
+        run: |
+          java -version 2>&1 | tee /dev/stderr | grep -q '"17\.'
+          node --version | tee /dev/stderr | grep -q '^v20\.'
